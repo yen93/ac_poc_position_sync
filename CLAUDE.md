@@ -15,24 +15,34 @@ linked account has nowhere to store a title.
 - Deploy via Supabase MCP `deploy_edge_function`, `verify_jwt:false`. No config.toml/deno.json/import map;
   deps pinned inline. Base URL: `https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/<name>`.
 - Secrets (already set, shared with `alternate-lead-finder`): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
-  `APIFY_API_TOKEN`, `AC_API_URL`, `AC_API_TOKEN`. Optional `APIFY_ACTOR`
-  (default `scrapersdelight~decision-maker-email-finder`), `APIFY_LIMIT`.
+  `OPENAI_API_KEY`, `AC_API_URL`, `AC_API_TOKEN`. Optional `OPENAI_MODEL` (default `gpt-4o`; must support the
+  Responses API `web_search_preview` tool), `MAX_TITLE_ATTEMPTS` (default 2).
+
+## Title source: OpenAI web-search-grounded (NOT Apify)
+Titles come from an OpenAI Responses-API call with the `web_search_preview` tool: it verifies the person's
+CURRENT title from public sources and returns null when unsure (never guesses). The source URL is stored in
+`poc_job_title_source`. Each definitive "no confident title" bumps `poc_job_title_search_attempts`; once it
+reaches `MAX_TITLE_ATTEMPTS` the (paid) lookup is skipped so unresolvable leads don't keep costing money.
+Cost ~2-3c per lookup (the web-search tool fee dominates; model choice barely matters).
+(History: the original implementation used the Apify `decision-maker-email-finder` actor, which had a 0% hit
+rate here because it is domain-scoped, not person-scoped. Replaced with OpenAI grounding.)
 
 ## Data (4 tables)
 `manually_found_leads`, `ai_scraped_soc_med_leads`, `manually_found_cold_leads`, `ai_verified_cold_leads`.
 Columns added by `migration.sql`: `poc_job_title text`, `ac_job_title_is_updated_date timestamptz`,
 `job_title_is_manually_set boolean default false`, `ac_account_needs_update boolean default false`,
-`ac_acc_linked boolean default false`.
+`ac_acc_linked boolean default false`, `poc_job_title_source text`,
+`poc_job_title_search_attempts integer default 0`.
 
 ## n8n order: run `ac-poc-position-sync` FIRST, then `ac-account-contact-sync`
 
 ### 1) ac-poc-position-sync (title sync for already-linked contacts)
 Selects eligible rows: `ac_job_title_is_updated_date IS NULL AND (job_title_is_manually_set IS NULL OR = false)`.
-Per row (AC contact resolved before any Apify call):
+Per row (AC contact resolved before any OpenAI call):
 - contact not found in AC -> skip, retryable.
 - has account link, jobTitle SET -> `job_title_is_manually_set=true` (never overwrite).
-- has account link, jobTitle EMPTY -> enrich (Apify) + PUT jobTitle + stamp `ac_job_title_is_updated_date`.
-- **no account link -> `ac_account_needs_update=true`** (handed to function 2; no Apify).
+- has account link, jobTitle EMPTY -> enrich (OpenAI) + PUT jobTitle + stamp `ac_job_title_is_updated_date`.
+- **no account link -> `ac_account_needs_update=true`** (handed to function 2; no enrichment).
 
 ### 2) ac-account-contact-sync (link org account, then fill title)
 Selects rows: `ac_account_needs_update = true`. Per row:
@@ -43,14 +53,14 @@ Selects rows: `ac_account_needs_update = true`. Per row:
 - org matches an AC account (exact, diacritic-/whitespace-insensitive) -> create the contact<->account link
   (`ac_acc_linked=true`, `ac_account_needs_update=false`), then enrich + PUT jobTitle + stamp date.
 
-Hand-off: if fn2 links but Apify finds no title, the row (now has a link, empty title, `needs_update=false`)
-is picked up by **fn1** on the next cycle to fill the title.
+Hand-off: if fn2 links but the OpenAI lookup finds no title, the row (now has a link, empty title,
+`needs_update=false`) is picked up by **fn1** on the next cycle to fill the title.
 
 ## Invoke (both functions share these)
 - `?sync=1` run inline + JSON summary; default = 202 + background task.
 - `?limit=N` rows per run (default 10).
 - `?email=<addr>` process only that email across tables, ignoring the selection filter (targeted reprocessing).
-- `?title=<text>` manual title override (skips Apify; still never overwrites an existing AC title).
+- `?title=<text>` manual title override (skips enrichment; still never overwrites an existing AC title).
 
 Example (curl.exe on Windows; anon key as `apikey`):
 ```
@@ -60,9 +70,10 @@ curl -s -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/ac-accoun
 
 ## Notes
 - Both functions duplicate the shared helpers inline (house style: no shared import map).
-- Apify actor is domain-scoped -> a specific person may not be returned; those titles stay retryable. Swap
-  `APIFY_ACTOR` for a person/profile actor if hit-rate matters (env-only change).
+- Title lookup returns null when the person/title can't be verified (guardrail against CRM hallucination) and
+  records the source URL in `poc_job_title_source`. Unresolvable rows stop being looked up after
+  `MAX_TITLE_ATTEMPTS` (see `poc_job_title_search_attempts`).
 - Org->account matching is exact (accent/whitespace-insensitive). Typos/variant names won't auto-link
   (deliberate, to avoid wrong links).
 - Deploy tip: the deploy pipeline interprets `\u` escapes -> keep source ASCII and `\u`-free (see the
-  `stripDiacritics` codepoint filter in fn2).
+  `stripDiacritics` codepoint filter in fn2, and the `openaiFindTitle` prompt built with string concatenation).

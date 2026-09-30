@@ -1,0 +1,84 @@
+================================================================================
+AS-BUILT — ac_poc_position_sync
+Last updated: 2026-09-30
+================================================================================
+
+OVERVIEW
+Two Supabase Edge Functions that fill the ActiveCampaign (AC) contact "Job Title"
+for leads in 4 tables, and link contacts to their org account when missing.
+Called in sequence from n8n. AC has no native/custom Job Title field — the title
+lives on the contact<->account link (accountContacts[].jobTitle), so a contact
+with no linked account has nowhere to store one.
+
+SCRIPTS (Supabase Edge Functions — Deno/TypeScript, deps pinned inline)
+- supabase/functions/ac-poc-position-sync/index.ts — STEP 1 of 2. For eligible
+  rows (ac_job_title_is_updated_date IS NULL AND (job_title_is_manually_set IS
+  NULL OR false)): resolve the AC contact + account link FIRST (before any OpenAI
+  call), then: no contact -> skip; account link + title set -> mark
+  job_title_is_manually_set=true; account link + title empty -> enrich (OpenAI
+  web-search) + PUT jobTitle + stamp date; no account link -> set
+  ac_account_needs_update=true.
+  Deployed version: 6 (verify_jwt:false).
+  Requires (Supabase env secrets): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+  OPENAI_API_KEY, AC_API_URL, AC_API_TOKEN; optional OPENAI_MODEL (default gpt-4o),
+  MAX_TITLE_ATTEMPTS (default 2).
+- supabase/functions/ac-account-contact-sync/index.ts — STEP 2 of 2. Selects
+  rows where ac_account_needs_update = true: match the row's org to an existing
+  AC account (exact, diacritic-/whitespace-insensitive); on match create the
+  contact<->account link (ac_acc_linked=true, ac_account_needs_update=false) then
+  enrich + PUT jobTitle + stamp date; no org/no match -> left flagged
+  (no_account_match); already-linked -> clear flag + fill/mark title.
+  Deployed version: 2 (verify_jwt:false). Same required secrets as above.
+  Shared helpers are duplicated inline in each file (no shared import map).
+  Both accept ?sync=1, ?limit=N (default 10), ?email=<addr> (targeted, ignores
+  the selection filter), ?title=<text> (manual override, skips enrichment). Each
+  JSON summary includes an "fn" field naming the function.
+
+- migration.sql — the schema migration (ALTER TABLE ADD COLUMN IF NOT EXISTS),
+  applied to MAGTestProject via Supabase MCP apply_migration. Adds poc_job_title,
+  ac_job_title_is_updated_date, job_title_is_manually_set, ac_account_needs_update
+  (migration add_poc_job_title_sync_columns), ac_acc_linked (migration
+  add_ac_acc_linked_column), and poc_job_title_source + poc_job_title_search_attempts
+  (migration add_title_source_and_attempts) to the 4 tables.
+
+EXTERNAL INTEGRATIONS
+- ActiveCampaign (REST API v3, ${AC_API_URL}/api/3/...; header Api-Token) —
+  contact lookup (?email=), account links (/contacts/{id}/accountContacts),
+  account search (/accounts?search=), create link (POST /accountContacts),
+  set title (PUT /accountContacts/{id}). Credentials in Supabase env secrets
+  (AC_API_URL, AC_API_TOKEN); source of truth in GCP Secret Manager.
+- OpenAI (REST, api.openai.com/v1/responses; Responses API + web_search_preview
+  tool) — grounded lookup of a named person's CURRENT job title from public
+  sources; returns null when unverifiable (never guesses) and reports the source
+  URL. Model from OPENAI_MODEL (default gpt-4o). Key in Supabase env secret
+  OPENAI_API_KEY; source of truth GCP Secret Manager. ~2-3c per lookup (web-search
+  tool fee). Replaced the original Apify decision-maker actor, which had a 0% hit
+  rate here (domain-scoped, not person-scoped).
+- Supabase (Postgres + Edge Functions) — project MAGTestProject
+  (ref aivitcomiywiysrfwqxt). Functions read/write with the service-role key
+  (Supabase env secret SUPABASE_SERVICE_ROLE_KEY).
+
+DATA STORES (Supabase / Postgres, project aivitcomiywiysrfwqxt)
+- public.manually_found_leads, public.ai_scraped_soc_med_leads,
+  public.manually_found_cold_leads, public.ai_verified_cold_leads — the 4 lead
+  tables. Each has, in addition to its existing columns:
+    poc_job_title text
+    ac_job_title_is_updated_date timestamptz (null until AC title written)
+    job_title_is_manually_set boolean default false
+    ac_account_needs_update boolean default false
+    ac_acc_linked boolean default false
+    poc_job_title_source text (URL the title was verified from, or "manual")
+    poc_job_title_search_attempts integer default 0 (capped at MAX_TITLE_ATTEMPTS)
+  Name columns differ per table (first_name/last_name vs firstname/lastname;
+  manually_found_cold_leads has both — coalesced). All have email and org.
+
+AUTOMATIONS / ROUTINES
+- n8n workflow (wired manually by the user) calls ac-poc-position-sync first,
+  then ac-account-contact-sync, on a schedule. Not managed in this repo.
+
+OTHER
+- activecampaign-job-title-sync.html — a local iMAG-themed end-user guide page
+  for this automation (self-contained; Google Fonts + gstatic banner only).
+- CLAUDE.md — dev-facing conventions/gotchas (deploy method, secrets, run order,
+  the \u/encoding deploy pitfall).
+================================================================================

@@ -7,29 +7,34 @@
 // contact<->account link (`accountContacts`). A contact with no linked account has
 // nowhere to store a title -- so we create the link first, then fill.
 //
+// TITLE SOURCE: an OpenAI web-search-grounded lookup (Responses API +
+// web_search_preview). It verifies the person's CURRENT title from public sources
+// and returns null when unsure (never guesses). The source URL is stored in
+// poc_job_title_source; each definitive miss bumps poc_job_title_search_attempts,
+// and the lookup is skipped once it reaches MAX_TITLE_ATTEMPTS.
+//
 // Per-row outcomes (rows selected by ac_account_needs_update=true):
-//   - AC contact not found                 -> leave flagged, retryable (no Apify).
+//   - AC contact not found                 -> leave flagged, retryable.
 //   - contact already has an account link  -> clear the flag; fill title (empty) or
 //                                             mark job_title_is_manually_set (already set).
 //   - no org on the row                    -> leave flagged (no_account_match).
 //   - org has no matching AC account       -> leave flagged (no_account_match).
 //   - org matches an AC account            -> create link (ac_acc_linked=true,
-//         ac_account_needs_update=false), then enrich (Apify) + PUT jobTitle +
+//         ac_account_needs_update=false), then enrich (OpenAI) + PUT jobTitle +
 //         stamp ac_job_title_is_updated_date.
 //
 // Org->account matching is EXACT but diacritic-/whitespace-insensitive (so "Nestle"
-// with an accent matches the AC account "Nestle"); typos/variant names do NOT link,
-// to avoid linking a contact to the wrong company.
+// with an accent matches the AC account "Nestle"); typos/variant names do NOT link.
 //
-// Credit-safe: contact + account resolution happens BEFORE any Apify call.
+// Credit-safe: contact + account resolution happens BEFORE any OpenAI call.
 //
 // Invoke: POST/GET ?limit=N (default 10) ?sync=1 (inline + summary). Default -> 202.
 // Debug: ?email=<addr> (process only that email, ignore the flag filter),
-//        ?title=<text> (manual title override, skips Apify).
+//        ?title=<text> (manual title override, skips enrichment).
 //
 // Deploy: Supabase MCP deploy_edge_function, verify_jwt:false.
-// Secrets: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, APIFY_API_TOKEN, AC_API_URL,
-//          AC_API_TOKEN; optional APIFY_ACTOR, APIFY_LIMIT.
+// Secrets: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY, AC_API_URL,
+//          AC_API_TOKEN; optional OPENAI_MODEL, MAX_TITLE_ATTEMPTS.
 
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
@@ -39,13 +44,13 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const AC_API_URL = (Deno.env.get("AC_API_URL") ?? "").replace(/\/+$/, "");
 const AC_API_TOKEN = Deno.env.get("AC_API_TOKEN") ?? "";
-const APIFY_API_TOKEN = Deno.env.get("APIFY_API_TOKEN") ?? "";
-const APIFY_ACTOR = Deno.env.get("APIFY_ACTOR") ?? "scrapersdelight~decision-maker-email-finder";
-const APIFY_LIMIT = parseInt(Deno.env.get("APIFY_LIMIT") ?? "10", 10);
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
+const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") ?? "gpt-4o";
+const MAX_TITLE_ATTEMPTS = parseInt(Deno.env.get("MAX_TITLE_ATTEMPTS") ?? "2", 10);
 
 const DEFAULT_LIMIT = 10;
 const WALL_CLOCK_MS = parseInt(Deno.env.get("WALL_CLOCK_MS") ?? "150000", 10);
-const APIFY_CALL_RESERVE_MS = parseInt(Deno.env.get("APIFY_CALL_RESERVE_MS") ?? "70000", 10);
+const OPENAI_CALL_RESERVE_MS = parseInt(Deno.env.get("OPENAI_CALL_RESERVE_MS") ?? "25000", 10);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const json = (body: unknown, status = 200) =>
@@ -68,12 +73,12 @@ interface Row {
   email: string | null;
   org: string | null;
   poc_job_title: string | null;
+  poc_job_title_search_attempts: number | null;
   ac_contact_created: string | null;
   first?: string | null;
   last?: string | null;
 }
 
-const norm = (s: unknown) => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 // Strip combining diacritical marks (U+0300..U+036F) without a \u regex literal.
 const stripDiacritics = (s: string): string => {
   let out = "";
@@ -91,49 +96,79 @@ const domainOf = (email: string): string | null => {
   return m ? m[1] : null;
 };
 
-// ---- Apify: scan a company domain, return decision-maker records. ----
-interface Person {
-  first: string;
-  last: string;
-  title: string | null;
-}
-async function apifyDomainSearch(domain: string): Promise<Person[] | null> {
-  if (!APIFY_API_TOKEN) {
-    console.warn("APIFY_API_TOKEN not set -- cannot enrich.");
-    return null;
-  }
-  const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`;
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domains: [domain], maxContactsPerDomain: APIFY_LIMIT, maxItems: APIFY_LIMIT, useGoogleFallback: true }),
-    });
-    if (!res.ok) {
-      console.warn(`Apify ${res.status} for ${domain}: ${(await res.text()).slice(0, 160)}`);
-      return null;
+// ---- OpenAI web-search-grounded title lookup ----
+interface TitleHit { title: string | null; source: string | null; confidence: string; }
+
+function openaiExtractText(d: unknown): string {
+  const doc = d as { output_text?: unknown; output?: unknown };
+  if (typeof doc?.output_text === "string" && doc.output_text.trim()) return doc.output_text;
+  const parts: string[] = [];
+  const out = Array.isArray(doc?.output) ? doc.output : [];
+  for (const item of out as Record<string, unknown>[]) {
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const c of content as Record<string, unknown>[]) {
+      if (typeof c?.text === "string") parts.push(c.text);
     }
-    const items = await res.json();
-    if (!Array.isArray(items)) return [];
-    return (items as Record<string, unknown>[]).map((it) => ({
-      first: norm(it.firstName ?? ""),
-      last: norm(it.lastName ?? ""),
-      title: (it.title ?? it.jobTitle ?? it.position ?? it.headline ?? null) as string | null,
-    }));
-  } catch (err) {
-    console.warn(`Apify fetch failed for ${domain}: ${err}`);
-    return null;
+  }
+  return parts.join("\n");
+}
+
+function parseTitleJson(text: string): TitleHit {
+  const fail: TitleHit = { title: null, source: null, confidence: "low" };
+  if (!text) return fail;
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) return fail;
+  try {
+    const o = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+    return {
+      title: o.title ? String(o.title).trim() : null,
+      source: o.source_url ? String(o.source_url).trim() : null,
+      confidence: o.confidence ? String(o.confidence).toLowerCase() : "low",
+    };
+  } catch {
+    return fail;
   }
 }
 
-function matchTitle(people: Person[], first: string, last: string): string | null {
-  const f = norm(first);
-  const l = norm(last);
-  if (!f && !l) return null;
-  let hit = people.find((p) => p.first === f && p.last === l && !!p.title);
-  if (!hit && f && l) hit = people.find((p) => p.last === l && p.first[0] === f[0] && !!p.title);
-  const t = hit?.title ? String(hit.title).trim() : "";
-  return t || null;
+async function openaiFindTitle(
+  first: string,
+  last: string,
+  org: string,
+  domain: string | null,
+): Promise<TitleHit | "retry"> {
+  if (!OPENAI_API_KEY) {
+    console.warn("OPENAI_API_KEY not set -- cannot enrich.");
+    return "retry";
+  }
+  const who = `${first} ${last}`.trim();
+  const companyBits = [org, domain ? `(${domain})` : ""].filter(Boolean).join(" ");
+  const input =
+    `You are verifying a person's CURRENT job title using web search. Only answer if ` +
+    `you can verify it from a reputable public source (LinkedIn, the company's own ` +
+    `website, a press release, a conference/event bio). If you cannot confidently ` +
+    `identify this exact person or their current title, return null for the title -- ` +
+    `never guess or infer.\n\n` +
+    `Person: ${who || "(unknown)"}\n` +
+    `Company: ${companyBits || "(unknown)"}\n\n` +
+    `Search the web, then respond with ONLY a compact JSON object and nothing else:\n` +
+    `{"title": <string or null>, "source_url": <string or null>, "confidence": "high"|"medium"|"low"}`;
+  try {
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: OPENAI_MODEL, tools: [{ type: "web_search_preview" }], input }),
+    });
+    if (!r.ok) {
+      console.warn(`OpenAI ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return "retry";
+    }
+    const d = await r.json();
+    return parseTitleJson(openaiExtractText(d));
+  } catch (err) {
+    console.warn(`OpenAI fetch failed: ${err}`);
+    return "retry";
+  }
 }
 
 // ---- ActiveCampaign helpers ----
@@ -175,8 +210,6 @@ async function acGetAccountLinks(contactId: string): Promise<AccountLink[] | nul
   }
 }
 
-// Find an existing AC account whose name EXACTLY matches (diacritic-/whitespace-
-// insensitive). Returns null when none matches (or on error).
 async function acFindAccountByName(name: string): Promise<{ id: string; name: string } | null> {
   const target = normName(name);
   if (!target) return null;
@@ -196,7 +229,6 @@ async function acFindAccountByName(name: string): Promise<{ id: string; name: st
   }
 }
 
-// Create a contact<->account link. Returns the new accountContact id, or null.
 async function acCreateAccountContact(contactId: string, accountId: string): Promise<string | null> {
   try {
     const r = await fetch(`${AC_API_URL}/api/3/accountContacts`, {
@@ -245,7 +277,8 @@ type Summary = {
   no_account_match: number;
   not_found_in_ac: number;
   no_title_found: number;
-  no_domain: number;
+  exhausted: number;
+  no_identifiers: number;
   stopped_early: boolean;
   errors: string[];
 };
@@ -255,7 +288,6 @@ async function resolveTitle(
   db: SupabaseClient,
   cfg: TableCfg,
   row: Row,
-  domainCache: Map<string, Person[] | null>,
   runStarted: number,
   s: Summary,
   overrideTitle?: string,
@@ -265,7 +297,7 @@ async function resolveTitle(
 
   if (overrideTitle && overrideTitle.trim()) {
     const title = overrideTitle.trim();
-    const { error } = await db.from(cfg.table).update({ poc_job_title: title }).eq("id", row.id);
+    const { error } = await db.from(cfg.table).update({ poc_job_title: title, poc_job_title_source: "manual" }).eq("id", row.id);
     if (error) {
       s.errors.push(`${cfg.table}#${row.id} store title: ${error.message}`);
       return { kind: "retry" };
@@ -274,34 +306,40 @@ async function resolveTitle(
     return { kind: "title", title };
   }
 
+  const org = (row.org ?? "").trim();
   const domain = domainOf((row.email ?? "").trim());
-  if (!domain) {
-    s.no_domain++;
+  if (!org && !domain) {
+    s.no_identifiers++;
     return { kind: "retry" };
   }
-  let people = domainCache.get(domain);
-  if (people === undefined) {
-    if (Date.now() - runStarted > WALL_CLOCK_MS - APIFY_CALL_RESERVE_MS) {
-      s.stopped_early = true;
-      return { kind: "retry" };
-    }
-    people = await apifyDomainSearch(domain);
-    domainCache.set(domain, people);
-    await sleep(500);
+  const attempts = row.poc_job_title_search_attempts ?? 0;
+  if (attempts >= MAX_TITLE_ATTEMPTS) {
+    s.exhausted++;
+    return { kind: "none" };
   }
-  if (people === null) return { kind: "retry" };
-  const t = matchTitle(people, row.first ?? "", row.last ?? "");
-  if (!t) {
+  if (Date.now() - runStarted > WALL_CLOCK_MS - OPENAI_CALL_RESERVE_MS) {
+    s.stopped_early = true;
+    return { kind: "retry" };
+  }
+
+  const hit = await openaiFindTitle(row.first ?? "", row.last ?? "", org, domain);
+  await sleep(300);
+  if (hit === "retry") return { kind: "retry" };
+  if (!hit.title || hit.confidence === "low") {
+    await db.from(cfg.table).update({ poc_job_title_search_attempts: attempts + 1 }).eq("id", row.id);
     s.no_title_found++;
     return { kind: "none" };
   }
-  const { error } = await db.from(cfg.table).update({ poc_job_title: t }).eq("id", row.id);
+  const { error } = await db
+    .from(cfg.table)
+    .update({ poc_job_title: hit.title, poc_job_title_source: hit.source ?? OPENAI_MODEL })
+    .eq("id", row.id);
   if (error) {
     s.errors.push(`${cfg.table}#${row.id} store title: ${error.message}`);
     return { kind: "retry" };
   }
   s.enriched++;
-  return { kind: "title", title: t };
+  return { kind: "title", title: hit.title };
 }
 
 async function fillTitle(
@@ -309,12 +347,11 @@ async function fillTitle(
   cfg: TableCfg,
   row: Row,
   accountContactId: string,
-  domainCache: Map<string, Person[] | null>,
   runStarted: number,
   s: Summary,
   overrideTitle?: string,
 ): Promise<void> {
-  const e = await resolveTitle(db, cfg, row, domainCache, runStarted, s, overrideTitle);
+  const e = await resolveTitle(db, cfg, row, runStarted, s, overrideTitle);
   if (e.kind !== "title") return;
   const ok = await acSetJobTitle(accountContactId, e.title);
   if (!ok) return;
@@ -327,7 +364,6 @@ async function processRow(
   db: SupabaseClient,
   cfg: TableCfg,
   row: Row,
-  domainCache: Map<string, Person[] | null>,
   runStarted: number,
   s: Summary,
   overrideTitle?: string,
@@ -355,7 +391,7 @@ async function processRow(
       else s.manually_set++;
       return;
     }
-    await fillTitle(db, cfg, row, link.id, domainCache, runStarted, s, overrideTitle);
+    await fillTitle(db, cfg, row, link.id, runStarted, s, overrideTitle);
     return;
   }
 
@@ -363,28 +399,27 @@ async function processRow(
   const org = (row.org ?? "").trim();
   if (!org) {
     s.no_account_match++;
-    return; // leave flagged
+    return;
   }
   const account = await acFindAccountByName(org);
   if (!account) {
     s.no_account_match++;
-    return; // leave flagged; org has no matching AC account
+    return;
   }
   const newLinkId = await acCreateAccountContact(contactId, account.id);
-  if (!newLinkId) return; // link creation failed -> retryable (still flagged)
+  if (!newLinkId) return; // retryable (still flagged)
   const { error: linkErr } = await db
     .from(cfg.table)
     .update({ ac_acc_linked: true, ac_account_needs_update: false })
     .eq("id", row.id);
   if (linkErr) s.errors.push(`${cfg.table}#${row.id} ac_acc_linked: ${linkErr.message}`);
   else s.ac_linked++;
-  await fillTitle(db, cfg, row, newLinkId, domainCache, runStarted, s, overrideTitle);
+  await fillTitle(db, cfg, row, newLinkId, runStarted, s, overrideTitle);
 }
 
 async function run(limit: number, opts?: { email?: string; title?: string }): Promise<Summary> {
   const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } });
   const runStarted = Date.now();
-  const domainCache = new Map<string, Person[] | null>();
   const targetEmail = opts?.email?.trim() || null;
   const overrideTitle = opts?.title?.trim() || undefined;
   const s: Summary = {
@@ -398,7 +433,8 @@ async function run(limit: number, opts?: { email?: string; title?: string }): Pr
     no_account_match: 0,
     not_found_in_ac: 0,
     no_title_found: 0,
-    no_domain: 0,
+    exhausted: 0,
+    no_identifiers: 0,
     stopped_early: false,
     errors: [],
   };
@@ -414,7 +450,7 @@ async function run(limit: number, opts?: { email?: string; title?: string }): Pr
 
     let sel = db
       .from(cfg.table)
-      .select(`id, email, org, poc_job_title, ac_contact_created, ${nameSelect}`)
+      .select(`id, email, org, poc_job_title, poc_job_title_search_attempts, ac_contact_created, ${nameSelect}`)
       .not("email", "is", null);
     if (targetEmail) {
       sel = sel.eq("email", targetEmail); // targeted reprocessing, ignore the flag filter
@@ -435,7 +471,7 @@ async function run(limit: number, opts?: { email?: string; title?: string }): Pr
       s.considered++;
       remaining--;
       try {
-        await processRow(db, cfg, r, domainCache, runStarted, s, overrideTitle);
+        await processRow(db, cfg, r, runStarted, s, overrideTitle);
       } catch (err) {
         s.errors.push(`${cfg.table}#${r.id}: ${err instanceof Error ? err.message : String(err)}`);
       }
