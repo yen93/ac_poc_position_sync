@@ -1,0 +1,15 @@
+## your_main_task:
+	- Create a supabase edge function to automate the process of filling out the contact job title field in Active Campaign.
+
+## do_this_before_starting_automation:
+	1. add "poc_job_title" column to ff tables: manually_found_leads, ai_scraped_soc_med_leads, manually_found_cold_leads, ai_verified_cold_leads
+	2. add "ac_job_title_is_updated_date" (timestamp default null) column to same 4 tables
+	3. Add "job_title_is_manually_set" column to same 4 tables
+
+## data_to_process:
+Select * from all 4 tables where (ac_job_title_is_updated_date is null and (job_title_is_manually_set is null or false))
+
+## automation_steps:
+	1. find and set the poc_job_title of each row in all those tables (what tool or service is good? Preferably free. Can you use apify? Api key is in GSM).
+	2. Go to active campaign contact and if job title field is null, fill it out with the poc_job_title found in prev step. If field is not null, do not update AC contact and set supabase column job_title_is_manually_set to true.
+If contact job title in AC was previously null and filled out by prev step, Update "ac_job_title_is_updated_date" to current datetime 

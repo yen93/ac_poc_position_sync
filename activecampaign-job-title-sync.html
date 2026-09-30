@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ActiveCampaign Job Title Sync</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Lato', Arial, sans-serif; background: #ffffff; }
+  .col { max-width: 760px; margin: 0 auto; padding: 32px 20px; }
+  .header-band {
+    background: linear-gradient(rgba(0,0,0,0.4), rgba(0,0,0,0.4)), url(https://ssl.gstatic.com/atari/images/simple-header-blended-small.png) center/cover, #37474F;
+    min-height: 320px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 20px;
+  }
+  .header-band h1 {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-weight: 300;
+    font-size: 44px;
+    letter-spacing: 0.5px;
+    margin: 0 0 12px 0;
+    line-height: 1.2;
+  }
+  .header-band .subtitle {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-weight: 300;
+    font-size: 18px;
+    margin: 0;
+    opacity: 0.9;
+  }
+  .intro-band { background: #323232; }
+  .intro-band p {
+    color: #ffffff;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .header-strip { background: #F2F2F2; }
+  .header-strip .col { padding: 32px 20px; }
+  .header-strip h2 {
+    color: #37474F;
+    font-family: 'Lato', sans-serif;
+    font-weight: 400;
+    font-size: 26px;
+    margin: 0;
+  }
+  .content-band { background: #ffffff; }
+  .content-band h3 {
+    color: #37474F;
+    font-family: 'Lato', sans-serif;
+    font-weight: 700;
+    font-size: 19px;
+    margin: 24px 0 8px 0;
+  }
+  .content-band h3:first-child { margin-top: 0; }
+  .content-band p {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0 0 16px 0;
+  }
+  .content-band ul, .content-band ol {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    padding-left: 24px;
+    margin: 0 0 16px 0;
+  }
+  .content-band li { margin-bottom: 10px; }
+  .content-band a { color: #37474F; text-decoration: underline; }
+  .content-band code {
+    background: #F2F2F2;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 14px;
+  }
+  .placeholder-img {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    margin: 8px 0 4px 0;
+    border: 1px solid #e0e0e0;
+  }
+  .placeholder-caption {
+    color: #757575;
+    font-family: 'Lato', sans-serif;
+    font-size: 13px;
+    font-style: italic;
+    margin: 0 0 16px 0;
+  }
+  .closing-band p {
+    color: #212121;
+    font-family: 'Lato', sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    margin: 0 0 4px 0;
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER BANNER (top of page only) -->
+<div class="header-band">
+  <div>
+    <h1>ActiveCampaign Job Title Sync</h1>
+    <p class="subtitle">Two Supabase edge functions that fill contact job titles and link org accounts</p>
+  </div>
+</div>
+
+<!-- TOP INTRO DARK BAND -->
+<div class="intro-band">
+  <div class="col">
+    <p>Many leads in our sales tables have an ActiveCampaign (AC) contact whose Job Title is blank. This automation finds each person's job title and writes it into AC &mdash; but only when the field is currently empty, so a human-entered title is never overwritten. It runs as two small functions you call one after another from n8n: the first fills titles for contacts that already have a company attached, and the second attaches the company first when it's missing, then fills the title.</p>
+  </div>
+</div>
+
+<!-- SECTIONS -->
+
+<div class="header-strip">
+  <div class="col"><h2>What it does</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>It works across four lead tables in the Supabase project <strong>MAGTestProject</strong>: <code>manually_found_leads</code>, <code>ai_scraped_soc_med_leads</code>, <code>manually_found_cold_leads</code>, and <code>ai_verified_cold_leads</code>.</p>
+    <p>For each lead it will:</p>
+    <ul>
+      <li>Find the person's job title (via an Apify company scan, matched by name).</li>
+      <li>Write that title into the contact's AC record &mdash; <strong>only if the AC title is empty</strong>. If a title is already there, it's left untouched and the row is marked as manually set.</li>
+      <li>When the contact isn't attached to a company in AC, attach the matching company account first, then fill the title.</li>
+    </ul>
+    <p>A key detail about AC: there is no standalone "Job Title" field. A contact's job title lives on the link between the contact and their <em>company account</em>. So a contact with no company attached has nowhere to store a title &mdash; which is exactly what the second function fixes.</p>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>The two functions &mdash; run in order</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <h3>1. ac-poc-position-sync (runs first)</h3>
+    <p>Handles contacts that <strong>already have a company attached</strong> in AC:</p>
+    <ul>
+      <li>Title already set &rarr; leave AC alone, mark the row <code>job_title_is_manually_set = true</code>.</li>
+      <li>Title empty &rarr; find it and write it, then stamp the update date.</li>
+      <li>No company attached &rarr; flag the row <code>ac_account_needs_update = true</code> and hand it to the second function (no enrichment spent here).</li>
+      <li>Contact not in AC &rarr; skip and leave it for a later run.</li>
+    </ul>
+    <h3>2. ac-account-contact-sync (runs second)</h3>
+    <p>Picks up only the rows flagged <code>ac_account_needs_update = true</code>:</p>
+    <ul>
+      <li>Looks up the lead's <code>org</code> (company name) among AC's existing company accounts.</li>
+      <li>If it finds an exact match, it attaches that company to the contact, marks <code>ac_acc_linked = true</code>, then fills the job title and stamps the date.</li>
+      <li>If the company isn't in AC (or the name doesn't match), the row stays flagged for someone to set the company up manually.</li>
+    </ul>
+    <p>The hand-off is clean: if the second function attaches a company but the title can't be found that run, the first function picks the title up on the next cycle.</p>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>How it's built</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <h3>Architecture</h3>
+    <p>The whole thing is two Supabase Edge Functions (small serverless scripts) that read the lead tables, talk to two outside services, and write results back. End to end:</p>
+    <ul>
+      <li><strong>Lead tables (Supabase / Postgres)</strong> &mdash; the source of leads and the place every result is recorded (job title found, whether AC was updated, whether a company needs attaching, etc.).</li>
+      <li><strong>Edge function reads eligible rows</strong> &mdash; each run selects a capped batch of rows still needing work, ordered oldest first.</li>
+      <li><strong>ActiveCampaign API (checked first)</strong> &mdash; the function looks up the contact and whether a company is attached <em>before</em> doing any enrichment, so it never spends credits on a lead it can't update.</li>
+      <li><strong>Apify (enrichment, only when needed)</strong> &mdash; when there's a real place to write an empty title, it scans the company's domain for decision-makers and matches the lead by name to read their title.</li>
+      <li><strong>Write back</strong> &mdash; the title is written to ActiveCampaign, and the outcome is recorded on the Supabase row. A status column is only set after the matching external call succeeds, so a mid-run failure just leaves the row to retry &mdash; no double writes.</li>
+      <li><strong>Orchestration (n8n)</strong> &mdash; an n8n workflow calls function one, then function two, on a schedule. Each function returns a JSON summary (tagged with its name) for the workflow's logs.</li>
+    </ul>
+    <h3>Tech stack</h3>
+    <ul>
+      <li><strong>Supabase</strong> &mdash; Postgres database (the lead tables) and Edge Functions runtime.</li>
+      <li><strong>Deno / TypeScript</strong> &mdash; the language the edge functions are written in.</li>
+      <li><strong>ActiveCampaign API</strong> &mdash; where contacts, company accounts, and job titles live.</li>
+      <li><strong>Apify</strong> &mdash; the enrichment service that finds job titles from a company domain.</li>
+      <li><strong>n8n</strong> &mdash; the workflow tool that runs the two functions in sequence.</li>
+      <li><strong>Google Secret Manager</strong> &mdash; the source of truth for the API keys, mirrored into Supabase's secret store.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>Running it</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>Each function accepts the same options on the request:</p>
+    <ul>
+      <li><code>?sync=1</code> &mdash; run immediately and return a summary (otherwise it runs in the background).</li>
+      <li><code>?limit=N</code> &mdash; how many rows to process this run (default 10).</li>
+      <li><code>?email=&lt;address&gt;</code> &mdash; process just one lead by email (handy for re-processing a single record).</li>
+      <li><code>?title=&lt;text&gt;</code> &mdash; set a specific title by hand instead of searching (still never overwrites an existing AC title).</li>
+    </ul>
+    <p>In normal use, n8n calls <code>ac-poc-position-sync</code> first and <code>ac-account-contact-sync</code> second, each with a sensible <code>limit</code>. The returned summary counts what happened: titles written, companies attached, titles already set, rows still needing a company, and so on.</p>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>Good to know</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <ul>
+      <li><strong>Existing titles are safe.</strong> The automation only fills a blank Job Title &mdash; it will never overwrite one that's already there.</li>
+      <li><strong>Company matching is deliberately strict.</strong> A company is only attached when the lead's <code>org</code> exactly matches an AC account name (ignoring accents and spacing). Typos or variant names (e.g. a misspelled company) are left for a person to handle, so a contact is never attached to the wrong company.</li>
+      <li><strong>Enrichment isn't perfect.</strong> The Apify source lists a company's decision-makers, so a specific person isn't always found; those rows keep their title blank and are simply retried later. The enrichment source can be swapped for a person-level one later without a code change.</li>
+      <li><strong>Cold leads not yet in AC</strong> are skipped and retried once they exist in ActiveCampaign.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- FIXED SECTIONS -->
+<section id="h.68f0b8918457bce8_82" style="background:#ffffff;padding:8px 20px;"><div style="max-width:760px;margin:0 auto;"><hr style="border:none;border-top:1px solid #d9d9d9;margin:0;"></div></section>
+<section id="h.5a0263770fa94d5d_3" style="background:#ffffff;padding:24px 20px;"><div style="max-width:760px;margin:0 auto;"><a href="#" style="display:inline-block;font-family:'Lato',sans-serif;font-size:15px;font-weight:400;color:#ffffff;background:#37474F;padding:12px 28px;border-radius:4px;text-decoration:none;letter-spacing:0.3px;">Button label</a></div></section>
+
+<!-- CLOSING BAND -->
+<div class="closing-band">
+  <div class="col">
+    <p>Updated by: Julienne</p>
+    <p>Last Update: 30 September 2026</p>
+  </div>
+</div>
+
+</body>
+</html>
