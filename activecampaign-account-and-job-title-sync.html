@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ActiveCampaign Job Title Sync</title>
+<title>ActiveCampaign Account &amp; Job Title Sync</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
@@ -115,15 +115,15 @@
 <!-- HEADER BANNER (top of page only) -->
 <div class="header-band">
   <div>
-    <h1>ActiveCampaign Job Title Sync</h1>
-    <p class="subtitle">Two Supabase edge functions that fill contact job titles and link org accounts</p>
+    <h1>ActiveCampaign Account &amp; Job Title Sync</h1>
+    <p class="subtitle">Two Supabase edge functions that link contacts to their org account and fill contact job titles</p>
   </div>
 </div>
 
 <!-- TOP INTRO DARK BAND -->
 <div class="intro-band">
   <div class="col">
-    <p>Many leads in our sales tables have an ActiveCampaign (AC) contact whose Job Title is blank. This automation finds each person's job title and writes it into AC &mdash; but only when the field is currently empty, so a human-entered title is never overwritten. It runs as two small functions you call one after another from n8n: the first fills titles for contacts that already have a company attached, and the second attaches the company first when it's missing, then fills the title.</p>
+    <p>Many leads in our sales tables have an ActiveCampaign (AC) contact whose Job Title is blank. This automation finds each person's job title and writes it into AC &mdash; but only when the field is currently empty, so a human-entered title is never overwritten. It runs as two small functions you call one after another from n8n: the first attaches a company account to contacts that don't have one and then fills the title, and the second fills titles for contacts that already have a company attached.</p>
   </div>
 </div>
 
@@ -137,7 +137,7 @@
     <p>It works across four lead tables in the Supabase project <strong>MAGTestProject</strong>: <code>manually_found_leads</code>, <code>ai_scraped_soc_med_leads</code>, <code>manually_found_cold_leads</code>, and <code>ai_verified_cold_leads</code>.</p>
     <p>For each lead it will:</p>
     <ul>
-      <li>Find the person's job title (via an Apify company scan, matched by name).</li>
+      <li>Find the person's job title via an OpenAI web-search-grounded lookup that verifies the current title from public sources &mdash; and returns nothing when it can't confirm, so it never guesses.</li>
       <li>Write that title into the contact's AC record &mdash; <strong>only if the AC title is empty</strong>. If a title is already there, it's left untouched and the row is marked as manually set.</li>
       <li>When the contact isn't attached to a company in AC, attach the matching company account first, then fill the title.</li>
     </ul>
@@ -150,22 +150,45 @@
 </div>
 <div class="content-band">
   <div class="col">
-    <h3>1. ac-poc-position-sync (runs first)</h3>
+    <h3>1. ac-account-contact-sync (runs first)</h3>
+    <p>Handles contacts that <strong>don't have a company attached</strong> in AC. It finds them from our local mirror of AC contacts: any lead whose contact has no company (its <code>orgid</code> is <code>'0'</code>), plus any row previously flagged <code>ac_account_needs_update = true</code>. Contacts we've already linked are skipped.</p>
+    <ul>
+      <li>Looks up the lead's <code>org</code> (company name) among AC's existing company accounts.</li>
+      <li>If it finds an exact match, it attaches that company to the contact, marks <code>ac_acc_linked = true</code>, then fills the job title and stamps the date.</li>
+      <li>If the contact already has a company (linked in the meantime), it just fills the title when it's blank.</li>
+      <li>If the company isn't in AC (or the name doesn't match), the row stays flagged for someone to set the company up manually.</li>
+      <li>Contact not in AC &rarr; leave it for a later run.</li>
+    </ul>
+    <h3>2. ac-poc-position-sync (runs second)</h3>
     <p>Handles contacts that <strong>already have a company attached</strong> in AC:</p>
     <ul>
       <li>Title already set &rarr; leave AC alone, mark the row <code>job_title_is_manually_set = true</code>.</li>
       <li>Title empty &rarr; find it and write it, then stamp the update date.</li>
-      <li>No company attached &rarr; flag the row <code>ac_account_needs_update = true</code> and hand it to the second function (no enrichment spent here).</li>
+      <li>No company attached &rarr; flag the row <code>ac_account_needs_update = true</code> so the first function links it on the next cycle (no enrichment spent here).</li>
       <li>Contact not in AC &rarr; skip and leave it for a later run.</li>
     </ul>
-    <h3>2. ac-account-contact-sync (runs second)</h3>
-    <p>Picks up only the rows flagged <code>ac_account_needs_update = true</code>:</p>
-    <ul>
-      <li>Looks up the lead's <code>org</code> (company name) among AC's existing company accounts.</li>
-      <li>If it finds an exact match, it attaches that company to the contact, marks <code>ac_acc_linked = true</code>, then fills the job title and stamps the date.</li>
-      <li>If the company isn't in AC (or the name doesn't match), the row stays flagged for someone to set the company up manually.</li>
-    </ul>
-    <p>The hand-off is clean: if the second function attaches a company but the title can't be found that run, the first function picks the title up on the next cycle.</p>
+    <p>The hand-off is clean: if the first function attaches a company but the title can't be found that run, the second function picks the title up on the next cycle.</p>
+  </div>
+</div>
+
+<div class="header-strip">
+  <div class="col"><h2>Flowcharts</h2></div>
+</div>
+<div class="content-band">
+  <div class="col">
+    <p>These diagrams trace what each function does for a single lead row, from the rows it selects down to each possible outcome. Green is start/end, blue is an action, amber is a decision, and red is a stop or skip. (Click a diagram to view it full size.)</p>
+    <h3>1. ac-account-contact-sync (runs first)</h3>
+    <p>Selects contacts with no company attached in AC &mdash; found via the <code>activecampaign_contacts</code> mirror (<code>orgid = '0'</code>) or the <code>ac_account_needs_update</code> flag &mdash; attaches the matching company account, then fills the title.</p>
+    <a href="flowchart-ac-account-contact-sync.png" target="_blank" rel="noopener">
+      <img class="placeholder-img" src="flowchart-ac-account-contact-sync.png" alt="Flowchart for the ac-account-contact-sync function">
+    </a>
+    <p class="placeholder-caption">ac-account-contact-sync &mdash; link the org account, then fill the Job Title.</p>
+    <h3>2. ac-poc-position-sync (runs second)</h3>
+    <p>Fills the Job Title for contacts that already have a company attached; any contact still missing a company is flagged for the first function to link on the next cycle.</p>
+    <a href="flowchart-ac-poc-position-sync.png" target="_blank" rel="noopener">
+      <img class="placeholder-img" src="flowchart-ac-poc-position-sync.png" alt="Flowchart for the ac-poc-position-sync function">
+    </a>
+    <p class="placeholder-caption">ac-poc-position-sync &mdash; fill the Job Title for already-linked contacts.</p>
   </div>
 </div>
 
@@ -180,7 +203,7 @@
       <li><strong>Lead tables (Supabase / Postgres)</strong> &mdash; the source of leads and the place every result is recorded (job title found, whether AC was updated, whether a company needs attaching, etc.).</li>
       <li><strong>Edge function reads eligible rows</strong> &mdash; each run selects a capped batch of rows still needing work, ordered oldest first.</li>
       <li><strong>ActiveCampaign API (checked first)</strong> &mdash; the function looks up the contact and whether a company is attached <em>before</em> doing any enrichment, so it never spends credits on a lead it can't update.</li>
-      <li><strong>Apify (enrichment, only when needed)</strong> &mdash; when there's a real place to write an empty title, it scans the company's domain for decision-makers and matches the lead by name to read their title.</li>
+      <li><strong>OpenAI web search (enrichment, only when needed)</strong> &mdash; when there's a real place to write an empty title, it asks OpenAI's web-search tool to verify the person's current title from public sources (LinkedIn, the company's own site, press releases). It returns nothing when it can't confirm, so a wrong title is never invented, and unresolvable leads stop being looked up after a couple of attempts to avoid wasted cost.</li>
       <li><strong>Write back</strong> &mdash; the title is written to ActiveCampaign, and the outcome is recorded on the Supabase row. A status column is only set after the matching external call succeeds, so a mid-run failure just leaves the row to retry &mdash; no double writes.</li>
       <li><strong>Orchestration (n8n)</strong> &mdash; an n8n workflow calls function one, then function two, on a schedule. Each function returns a JSON summary (tagged with its name) for the workflow's logs.</li>
     </ul>
@@ -189,7 +212,7 @@
       <li><strong>Supabase</strong> &mdash; Postgres database (the lead tables) and Edge Functions runtime.</li>
       <li><strong>Deno / TypeScript</strong> &mdash; the language the edge functions are written in.</li>
       <li><strong>ActiveCampaign API</strong> &mdash; where contacts, company accounts, and job titles live.</li>
-      <li><strong>Apify</strong> &mdash; the enrichment service that finds job titles from a company domain.</li>
+      <li><strong>OpenAI (Responses API, web search)</strong> &mdash; the enrichment service that verifies job titles from public sources.</li>
       <li><strong>n8n</strong> &mdash; the workflow tool that runs the two functions in sequence.</li>
       <li><strong>Google Secret Manager</strong> &mdash; the source of truth for the API keys, mirrored into Supabase's secret store.</li>
     </ul>
@@ -208,7 +231,7 @@
       <li><code>?email=&lt;address&gt;</code> &mdash; process just one lead by email (handy for re-processing a single record).</li>
       <li><code>?title=&lt;text&gt;</code> &mdash; set a specific title by hand instead of searching (still never overwrites an existing AC title).</li>
     </ul>
-    <p>In normal use, n8n calls <code>ac-poc-position-sync</code> first and <code>ac-account-contact-sync</code> second, each with a sensible <code>limit</code>. The returned summary counts what happened: titles written, companies attached, titles already set, rows still needing a company, and so on.</p>
+    <p>In normal use, n8n calls <code>ac-account-contact-sync</code> first and <code>ac-poc-position-sync</code> second, each with a sensible <code>limit</code>. The returned summary counts what happened: companies attached, titles written, titles already set, rows still needing a company, and so on.</p>
   </div>
 </div>
 
@@ -220,7 +243,7 @@
     <ul>
       <li><strong>Existing titles are safe.</strong> The automation only fills a blank Job Title &mdash; it will never overwrite one that's already there.</li>
       <li><strong>Company matching is deliberately strict.</strong> A company is only attached when the lead's <code>org</code> exactly matches an AC account name (ignoring accents and spacing). Typos or variant names (e.g. a misspelled company) are left for a person to handle, so a contact is never attached to the wrong company.</li>
-      <li><strong>Enrichment isn't perfect.</strong> The Apify source lists a company's decision-makers, so a specific person isn't always found; those rows keep their title blank and are simply retried later. The enrichment source can be swapped for a person-level one later without a code change.</li>
+      <li><strong>Enrichment isn't perfect.</strong> The web-search lookup only returns a title it can verify from public sources, so a specific person isn't always found; those rows keep their title blank and are retried later, up to a capped number of attempts so an unresolvable lead doesn't keep costing money.</li>
       <li><strong>Cold leads not yet in AC</strong> are skipped and retried once they exist in ActiveCampaign.</li>
     </ul>
   </div>
@@ -234,7 +257,7 @@
 <div class="closing-band">
   <div class="col">
     <p>Updated by: Julienne</p>
-    <p>Last Update: 30 September 2026</p>
+    <p>Last Update: 1 October 2026</p>
   </div>
 </div>
 

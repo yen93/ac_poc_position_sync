@@ -34,18 +34,15 @@ Columns added by `migration.sql`: `poc_job_title text`, `ac_job_title_is_updated
 `ac_acc_linked boolean default false`, `poc_job_title_source text`,
 `poc_job_title_search_attempts integer default 0`.
 
-## n8n order: run `ac-poc-position-sync` FIRST, then `ac-account-contact-sync`
+## n8n order: run `ac-account-contact-sync` FIRST, then `ac-poc-position-sync`
 
-### 1) ac-poc-position-sync (title sync for already-linked contacts)
-Selects eligible rows: `ac_job_title_is_updated_date IS NULL AND (job_title_is_manually_set IS NULL OR = false)`.
-Per row (AC contact resolved before any OpenAI call):
-- contact not found in AC -> skip, retryable.
-- has account link, jobTitle SET -> `job_title_is_manually_set=true` (never overwrite).
-- has account link, jobTitle EMPTY -> enrich (OpenAI) + PUT jobTitle + stamp `ac_job_title_is_updated_date`.
-- **no account link -> `ac_account_needs_update=true`** (handed to function 2; no enrichment).
-
-### 2) ac-account-contact-sync (link org account, then fill title)
-Selects rows: `ac_account_needs_update = true`. Per row:
+### 1) ac-account-contact-sync (link org account, then fill title)
+Selects rows per table: `email NOT NULL AND ac_acc_linked not true`, then kept where the lead's AC contact has
+**no linked account** -- i.e. the local `activecampaign_contacts` mirror (LEFT JOIN on `email`,
+case-insensitive) has `orgid = '0'` -- **OR** `ac_account_needs_update = true`. (Equivalent SQL:
+`select a.* from <table> a left join activecampaign_contacts b on lower(a.email)=lower(b.email)
+where b.orgid='0' or a.ac_account_needs_update = true`.) The `orgid='0'` side is resolved in JS via a batched
+`IN` lookup against the mirror, since PostgREST can't join on a non-FK column. Per row:
 - contact not found in AC -> leave flagged, retryable.
 - contact already has a link -> clear flag (`ac_account_needs_update=false`, `ac_acc_linked=true`); fill title
   if empty, else `job_title_is_manually_set=true`.
@@ -53,8 +50,19 @@ Selects rows: `ac_account_needs_update = true`. Per row:
 - org matches an AC account (exact, diacritic-/whitespace-insensitive) -> create the contact<->account link
   (`ac_acc_linked=true`, `ac_account_needs_update=false`), then enrich + PUT jobTitle + stamp date.
 
-Hand-off: if fn2 links but the OpenAI lookup finds no title, the row (now has a link, empty title,
-`needs_update=false`) is picked up by **fn1** on the next cycle to fill the title.
+### 2) ac-poc-position-sync (title sync for already-linked contacts)
+Selects eligible rows: `ac_job_title_is_updated_date IS NULL AND (job_title_is_manually_set IS NULL OR = false)`.
+Per row (AC contact resolved before any OpenAI call):
+- contact not found in AC -> skip, retryable.
+- has account link, jobTitle SET -> `job_title_is_manually_set=true` (never overwrite).
+- has account link, jobTitle EMPTY -> enrich (OpenAI) + PUT jobTitle + stamp `ac_job_title_is_updated_date`.
+- **no account link -> `ac_account_needs_update=true`** (re-flagged for fn1 above on the next cycle; no enrichment).
+
+Hand-offs: fn1 picks up contacts whose AC contact shows no account (`orgid='0'`) directly from the mirror, so it
+no longer depends on fn2 flagging them first. If fn1 (`ac-account-contact-sync`) links a contact but the OpenAI
+lookup finds no title, the row (now linked, empty title) is picked up by fn2 (`ac-poc-position-sync`) to fill the
+title. Note: the mirror is a snapshot -- after a link is created in AC, `orgid` stays `'0'` until the mirror
+refreshes, but the `ac_acc_linked not true` guard stops the row being re-selected, so there's no reprocessing loop.
 
 ## Invoke (both functions share these)
 - `?sync=1` run inline + JSON summary; default = 202 + background task.
@@ -62,10 +70,10 @@ Hand-off: if fn2 links but the OpenAI lookup finds no title, the row (now has a 
 - `?email=<addr>` process only that email across tables, ignoring the selection filter (targeted reprocessing).
 - `?title=<text>` manual title override (skips enrichment; still never overwrites an existing AC title).
 
-Example (curl.exe on Windows; anon key as `apikey`):
+Example (curl.exe on Windows; anon key as `apikey`; fn1 = account-contact-sync runs first):
 ```
-curl -s -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/ac-poc-position-sync?sync=1&limit=20" -H "apikey: <ANON_KEY>"
 curl -s -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/ac-account-contact-sync?sync=1&limit=20" -H "apikey: <ANON_KEY>"
+curl -s -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/ac-poc-position-sync?sync=1&limit=20" -H "apikey: <ANON_KEY>"
 ```
 
 ## Notes
@@ -76,4 +84,7 @@ curl -s -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/ac-accoun
 - Org->account matching is exact (accent/whitespace-insensitive). Typos/variant names won't auto-link
   (deliberate, to avoid wrong links).
 - Deploy tip: the deploy pipeline interprets `\u` escapes -> keep source ASCII and `\u`-free (see the
-  `stripDiacritics` codepoint filter in fn2, and the `openaiFindTitle` prompt built with string concatenation).
+  `stripDiacritics` codepoint filter in `ac-account-contact-sync`, and the `openaiFindTitle` prompt built with
+  string concatenation).
+- `ac-account-contact-sync` reads the local `activecampaign_contacts` mirror (`email`, `orgid`) to find contacts
+  with no AC account (`orgid='0'`). Keep that mirror reasonably fresh for the selection to be accurate.

@@ -1,7 +1,10 @@
-// ac-account-contact-sync  (STEP 2 of 2; run AFTER ac-poc-position-sync)
-// Processes leads flagged ac_account_needs_update=true (contacts that exist in AC
-// but have no account link). For each: if the row's `org` matches an existing AC
-// account, link the account to the contact, then fill the Job Title.
+// ac-account-contact-sync  (STEP 1 of 2; run BEFORE ac-poc-position-sync)
+// Selects leads whose AC contact has NO linked account -- detected by LEFT JOINing
+// the local activecampaign_contacts mirror on email and keeping rows where
+// b.orgid = '0' -- OR that were explicitly flagged ac_account_needs_update=true.
+// For each: if the row's `org` matches an existing AC account, link the account to
+// the contact, then fill the Job Title. (Rows we have already linked -- ac_acc_linked
+// = true -- are skipped here and left to ac-poc-position-sync.)
 //
 // Where "Job Title" lives in AC: it is the `jobTitle` attribute of the
 // contact<->account link (`accountContacts`). A contact with no linked account has
@@ -13,7 +16,11 @@
 // poc_job_title_source; each definitive miss bumps poc_job_title_search_attempts,
 // and the lookup is skipped once it reaches MAX_TITLE_ATTEMPTS.
 //
-// Per-row outcomes (rows selected by ac_account_needs_update=true):
+// Row selection (per table): email NOT NULL AND ac_acc_linked not true, then kept
+//   when activecampaign_contacts.orgid = '0' (no account on the AC contact) OR
+//   ac_account_needs_update = true. The email join is case-insensitive.
+//   ?email=<addr> ignores this filter entirely (targeted reprocessing).
+// Per-row outcomes:
 //   - AC contact not found                 -> leave flagged, retryable.
 //   - contact already has an account link  -> clear the flag; fill title (empty) or
 //                                             mark job_title_is_manually_set (already set).
@@ -75,6 +82,7 @@ interface Row {
   poc_job_title: string | null;
   poc_job_title_search_attempts: number | null;
   ac_contact_created: string | null;
+  ac_account_needs_update?: boolean | null;
   first?: string | null;
   last?: string | null;
 }
@@ -95,6 +103,35 @@ const domainOf = (email: string): string | null => {
   const m = email.trim().toLowerCase().match(/@([^@\s]+)$/);
   return m ? m[1] : null;
 };
+
+// Looks up orgid for each lead email in the local activecampaign_contacts mirror
+// (the "b" side of the LEFT JOIN a.email = b.email). The join is case-insensitive:
+// we query both the original and lowercased spellings and key the result by lower().
+// Returns Map<lower(email) -> orgid>; an email with no mirror row is simply absent.
+async function fetchOrgids(db: SupabaseClient, emails: string[]): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const variants = new Set<string>();
+  for (const e of emails) {
+    const t = e.trim();
+    if (!t) continue;
+    variants.add(t);
+    variants.add(t.toLowerCase());
+  }
+  const list = Array.from(variants);
+  const CHUNK = 200;
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const slice = list.slice(i, i + CHUNK);
+    const { data, error } = await db.from("activecampaign_contacts").select("email, orgid").in("email", slice);
+    if (error) {
+      console.warn(`activecampaign_contacts orgid lookup: ${error.message}`);
+      continue;
+    }
+    for (const a of (data ?? []) as { email: string | null; orgid: string | null }[]) {
+      if (a.email) map.set(a.email.trim().toLowerCase(), (a.orgid ?? "").trim());
+    }
+  }
+  return map;
+}
 
 // ---- OpenAI web-search-grounded title lookup ----
 interface TitleHit { title: string | null; source: string | null; confidence: string; }
@@ -448,22 +485,36 @@ async function run(limit: number, opts?: { email?: string; title?: string }): Pr
         ? "first:first_name, alt_first:firstname, last:last_name, alt_last:lastname"
         : `first:${cfg.firstCol}, last:${cfg.lastCol}`;
 
+    // Pull candidate rows: those we have not already linked. The orgid='0' side of
+    // the selection lives in activecampaign_contacts, so it is applied in JS below.
     let sel = db
       .from(cfg.table)
-      .select(`id, email, org, poc_job_title, poc_job_title_search_attempts, ac_contact_created, ${nameSelect}`)
+      .select(`id, email, org, poc_job_title, poc_job_title_search_attempts, ac_contact_created, ac_account_needs_update, ${nameSelect}`)
       .not("email", "is", null);
     if (targetEmail) {
-      sel = sel.eq("email", targetEmail); // targeted reprocessing, ignore the flag filter
+      sel = sel.eq("email", targetEmail); // targeted reprocessing, ignore the join filter
     } else {
-      sel = sel.eq("ac_account_needs_update", true);
+      sel = sel.or("ac_acc_linked.is.null,ac_acc_linked.eq.false");
     }
-    const { data, error } = await sel.order("id", { ascending: true }).limit(remaining);
+    const { data, error } = await sel.order("id", { ascending: true });
 
     if (error) {
       s.errors.push(`select ${cfg.table}: ${error.message}`);
       continue;
     }
-    const rows = (data ?? []) as unknown as (Row & { alt_first?: string; alt_last?: string })[];
+    let rows = (data ?? []) as unknown as (Row & { alt_first?: string; alt_last?: string })[];
+
+    // LEFT JOIN activecampaign_contacts b ON lower(a.email)=lower(b.email):
+    // keep rows where b.orgid='0' (contact has no AC account) OR ac_account_needs_update=true.
+    if (!targetEmail) {
+      const emails = rows.map((r) => (r.email ?? "").trim()).filter(Boolean);
+      const orgidByEmail = await fetchOrgids(db, emails);
+      rows = rows.filter((r) => {
+        const orgid = orgidByEmail.get((r.email ?? "").trim().toLowerCase());
+        return orgid === "0" || r.ac_account_needs_update === true;
+      });
+    }
+
     for (const r of rows) {
       if (remaining <= 0 || s.stopped_early) break;
       r.first = r.first ?? r.alt_first ?? null;
